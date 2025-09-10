@@ -28,49 +28,55 @@ const LiveTranslator: React.FC = () => {
 
   // WebSocket connection
   const connectWebSocket = useCallback(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.hostname}:8080`;
+    return new Promise((resolve, reject) => {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.hostname}:8080`;
 
-    websocketRef.current = new WebSocket(wsUrl);
+      websocketRef.current = new WebSocket(wsUrl);
 
-    websocketRef.current.onopen = () => {
-      console.log("WebSocket connected");
-      setStatus("Initializing real-time translation...");
-      setStatusType("processing");
-      websocketRef.current?.send(
-        JSON.stringify({
-          type: "init",
-          sessionId: Date.now().toString(),
-        })
-      );
-    };
+      websocketRef.current.onopen = () => {
+        console.log("WebSocket connected successfully");
+        console.log("WebSocket readyState:", websocketRef.current?.readyState);
+        setStatus("Initializing real-time translation...");
+        setStatusType("processing");
+        websocketRef.current?.send(
+          JSON.stringify({
+            type: "init",
+            sessionId: Date.now().toString(),
+          })
+        );
+        console.log("Sent init message to server");
+        resolve(true);
+      };
+
+      websocketRef.current.onerror = (error) => {
+        console.error("WebSocket connection error:", error);
+        reject(error);
+      };
 
     websocketRef.current.onmessage = (event) => {
       const data = JSON.parse(event.data);
       handleWebSocketMessage(data);
     };
 
-    websocketRef.current.onclose = () => {
-      console.log("WebSocket disconnected");
-      setStatus("Connection lost");
-      setStatusType("error");
-    };
-
-    websocketRef.current.onerror = (error) => {
-      console.error("WebSocket error:", error);
-      setStatus("Connection error");
-      setStatusType("error");
-    };
+      websocketRef.current.onclose = () => {
+        console.log("WebSocket disconnected");
+        setStatus("Connection lost");
+        setStatusType("error");
+      };
+    });
   }, []);
 
   // Handle WebSocket messages
   const handleWebSocketMessage = useCallback((data: any) => {
     switch (data.type) {
       case "session_ready":
-        setStatus("Real-time translation ready - Start speaking!");
-        setStatusType("ready");
+        setStatus("Recording... Speak in English");
+        setStatusType("recording");
+        console.log("Frontend: WebSocket session ready, audio streaming enabled");
         break;
       case "translated_audio":
+        console.log("Received translated audio from server");
         handleTranslatedAudio(data.audio);
         break;
       case "transcription":
@@ -78,6 +84,14 @@ const LiveTranslator: React.FC = () => {
         break;
       case "translation":
         setHindiText(data.text);
+        break;
+      case "speech_started":
+        setStatus("Listening... Speak clearly");
+        setStatusType("recording");
+        break;
+      case "speech_stopped":
+        setStatus("Processing translation...");
+        setStatusType("processing");
         break;
       case "session_stopped":
         setStatus("Translation session stopped");
@@ -108,15 +122,19 @@ const LiveTranslator: React.FC = () => {
   const sendAudioToServer = useCallback((audioBuffer: ArrayBuffer) => {
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
       try {
+        const audioArray = Array.from(new Uint8Array(audioBuffer));
+        console.log(`Frontend: Sending ${audioArray.length} bytes to server`);
         websocketRef.current.send(
           JSON.stringify({
             type: "audio",
-            audio: Array.from(new Uint8Array(audioBuffer)),
+            audio: audioArray,
           })
         );
       } catch (error) {
         console.error("Error sending audio:", error);
       }
+    } else {
+      console.warn("WebSocket not open, cannot send audio");
     }
   }, []);
 
@@ -128,6 +146,7 @@ const LiveTranslator: React.FC = () => {
         return;
       }
 
+      console.log(`Frontend: Processing ${audioData.length} bytes of translated audio`);
       const audioBuffer = new Uint8Array(audioData);
 
       if (audioBuffer.length < 2) {
@@ -135,22 +154,35 @@ const LiveTranslator: React.FC = () => {
         return;
       }
 
+      console.log(`Frontend: Adding audio to queue, current queue length: ${audioQueueRef.current.length}`);
       audioQueueRef.current.push(audioBuffer);
-      playNextAudio();
+      
+      // Play immediately if not already playing
+      if (!isPlaying) {
+        console.log("Frontend: Starting audio playback");
+        playNextAudio();
+      } else {
+        console.log("Frontend: Audio already playing, queued for later");
+      }
     } catch (error) {
       console.error("Error handling translated audio:", error);
     }
-  }, []);
+  }, [isPlaying]);
 
   // Play next audio in queue
   const playNextAudio = useCallback(async () => {
-    if (isPlaying || audioQueueRef.current.length === 0) return;
+    if (isPlaying || audioQueueRef.current.length === 0) {
+      console.log(`playNextAudio skipped - isPlaying: ${isPlaying}, queue length: ${audioQueueRef.current.length}`);
+      return;
+    }
 
+    console.log("Frontend: Starting audio playback");
     setIsPlaying(true);
     const audioData = audioQueueRef.current.shift()!;
 
     try {
       const pcmData = new Uint8Array(audioData);
+      console.log(`Frontend: Playing audio chunk of ${pcmData.length} bytes`);
 
       if (pcmData.length < 2) {
         console.log("Audio data too small, skipping playback");
@@ -159,6 +191,7 @@ const LiveTranslator: React.FC = () => {
       }
 
       const numSamples = Math.floor(pcmData.length / 2);
+      console.log(`Frontend: Creating audio buffer with ${numSamples} samples`);
 
       if (numSamples === 0) {
         console.log("No audio samples to play");
@@ -182,12 +215,17 @@ const LiveTranslator: React.FC = () => {
       source.connect(audioContext.destination);
 
       source.onended = () => {
+        console.log("Frontend: Audio chunk finished playing");
         setIsPlaying(false);
         if (audioQueueRef.current.length > 0) {
+          console.log(`Frontend: Playing next chunk, ${audioQueueRef.current.length} remaining`);
           playNextAudio();
+        } else {
+          console.log("Frontend: Audio playback complete");
         }
       };
 
+      console.log("Frontend: Starting audio source");
       source.start();
     } catch (error) {
       console.error("Error playing audio:", error);
@@ -219,24 +257,34 @@ const LiveTranslator: React.FC = () => {
       const source = audioContext.createMediaStreamSource(stream);
       const processor = audioContext.createScriptProcessor(8192, 1, 1);
 
+      // Store references first
+      audioRefs.current = { audioContext, processor, source };
+
+      // Connect WebSocket FIRST and wait for connection
+      await connectWebSocket();
+
+      // Set recording state FIRST
+      setIsRecording(true);
+      
+      // Setup audio processing AFTER WebSocket is connected
       processor.onaudioprocess = (event) => {
-        if (isRecording) {
+        // Check recording state from ref instead of closure
+        const currentlyRecording = audioRefs.current.audioContext !== null;
+        console.log(`Audio process event - isRecording: ${currentlyRecording}, WebSocket state: ${websocketRef.current?.readyState}`);
+        if (currentlyRecording && websocketRef.current?.readyState === WebSocket.OPEN) {
           const inputData = event.inputBuffer.getChannelData(0);
           const pcmData = convertFloat32ToInt16(inputData);
+          console.log(`Frontend: Audio chunk size: ${inputData.length} samples, PCM bytes: ${pcmData.byteLength}`);
           sendAudioToServer(pcmData);
+        } else {
+          console.log(`Skipping audio - isRecording: ${currentlyRecording}, WS state: ${websocketRef.current?.readyState}`);
         }
       };
 
       source.connect(processor);
       processor.connect(audioContext.destination);
 
-      // Store references
-      audioRefs.current = { audioContext, processor, source };
-
-      connectWebSocket();
-      setIsRecording(true);
-      setStatus("Recording... Speak in English");
-      setStatusType("recording");
+      console.log("Audio processing setup complete, WebSocket ready");
     } catch (error) {
       console.error("Error starting translation:", error);
       setStatus("Microphone access denied");
@@ -259,6 +307,13 @@ const LiveTranslator: React.FC = () => {
     if (audioRefs.current.audioContext) {
       audioRefs.current.audioContext.close();
     }
+
+    // Clear refs to stop audio processing
+    audioRefs.current = {
+      audioContext: null,
+      processor: null,
+      source: null,
+    };
 
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
       websocketRef.current.send(JSON.stringify({ type: "stop" }));

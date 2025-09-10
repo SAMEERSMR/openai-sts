@@ -35,20 +35,29 @@ wss.on("connection", (ws) => {
   let openaiWs = null;
   let isSessionActive = false;
   let responseInProgress = false;
-  let audioBuffer = Buffer.alloc(0);
-  let lastCommitTime = 0;
-  let totalAudioSent = 0; // Track total audio sent since last commit
+  let currentTranslation = ""; // Accumulate translation text
+  let audioChunks = []; // Accumulate audio chunks
 
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message);
+      console.log(`Server: Received message type: ${data.type}`);
 
       if (data.type === "init") {
+        console.log("Processing init message");
         await initializeOpenAISession(ws, data.sessionId);
-      } else if (data.type === "audio" && openaiWs && isSessionActive) {
-        await streamAudioToOpenAI(ws, data.audio);
+      } else if (data.type === "audio") {
+        console.log(`Server: Audio message - openaiWs: ${!!openaiWs}, isSessionActive: ${isSessionActive}`);
+        console.log(`Server: Received audio data, length: ${data.audio ? data.audio.length : 'undefined'} bytes`);
+        if (openaiWs && isSessionActive) {
+          await streamAudioToOpenAI(ws, data.audio);
+        } else {
+          console.log("Audio message received but session not ready");
+        }
       } else if (data.type === "stop") {
         await stopSession(ws);
+      } else {
+        console.log(`Unknown message type: ${data.type}`);
       }
     } catch (error) {
       console.error("Error processing message:", error);
@@ -86,7 +95,7 @@ wss.on("connection", (ws) => {
               modalities: ["text", "audio"],
               instructions:
                 "You are a real-time translator. When you receive English speech, translate it to Hindi and speak it back immediately. Only respond with the Hindi translation, no additional text or explanations. Keep responses short and natural.",
-              voice: "alloy",
+              voice: "shimmer",
               input_audio_format: "pcm16",
               output_audio_format: "pcm16",
               input_audio_transcription: {
@@ -94,9 +103,9 @@ wss.on("connection", (ws) => {
               },
               turn_detection: {
                 type: "server_vad",
-                threshold: 0.5,
+                threshold: 0.3,
                 prefix_padding_ms: 300,
-                silence_duration_ms: 500,
+                silence_duration_ms: 800,
               },
             },
           })
@@ -104,6 +113,7 @@ wss.on("connection", (ws) => {
 
         connections.set(ws, { sessionId, openaiWs });
         isSessionActive = true;
+        console.log("OpenAI session is now active, ready to receive audio");
 
         ws.send(
           JSON.stringify({
@@ -111,40 +121,77 @@ wss.on("connection", (ws) => {
             message: "Real-time translation ready",
           })
         );
+        console.log("Sent session_ready message to frontend");
       });
 
       openaiWs.on("message", (data) => {
         try {
           const message = JSON.parse(data.toString());
+          console.log(`OpenAI message type: ${message.type}`);
 
           switch (message.type) {
+            case "session.updated":
+              console.log("OpenAI session updated successfully");
+              break;
+
             case "response.created":
               responseInProgress = true;
+              currentTranslation = ""; // Reset translation for new response
+              audioChunks = []; // Reset audio chunks for new response
+              console.log("OpenAI creating response");
               break;
 
             case "response.audio.delta":
-              ws.send(
-                JSON.stringify({
-                  type: "translated_audio",
-                  audio: message.audio,
-                })
-              );
+              console.log(`Received audio delta: ${message.delta ? message.delta.length : 0} bytes`);
+              if (message.delta) {
+                // Accumulate audio chunks instead of sending immediately
+                const audioBytes = Buffer.from(message.delta, 'base64');
+                audioChunks.push(audioBytes);
+                console.log(`Accumulated audio chunk, total chunks: ${audioChunks.length}`);
+              }
               break;
 
-            case "response.transcript.delta":
-              ws.send(
-                JSON.stringify({
-                  type: "translation",
-                  text: message.transcript,
-                })
-              );
+            case "response.output_item.done":
+              if (message.item && message.item.type === "message") {
+                console.log("Translation completed");
+              }
+              break;
+
+            case "response.audio_transcript.delta":
+              if (message.delta) {
+                currentTranslation += message.delta;
+                console.log(`Translation fragment: ${message.delta}`);
+                console.log(`Full translation so far: ${currentTranslation}`);
+                ws.send(
+                  JSON.stringify({
+                    type: "translation",
+                    text: currentTranslation,
+                  })
+                );
+              }
               break;
 
             case "response.done":
               responseInProgress = false;
+              console.log("Response completed");
+              
+              // Send complete audio as one chunk
+              if (audioChunks.length > 0) {
+                const completeAudio = Buffer.concat(audioChunks);
+                const audioArray = Array.from(completeAudio);
+                console.log(`Sending complete audio: ${audioArray.length} bytes from ${audioChunks.length} chunks`);
+                ws.send(
+                  JSON.stringify({
+                    type: "translated_audio",
+                    audio: audioArray,
+                  })
+                );
+                audioChunks = []; // Clear chunks after sending
+              }
               break;
 
             case "input_audio_buffer.speech_started":
+              console.log("Speech detected - user started speaking");
               ws.send(
                 JSON.stringify({
                   type: "speech_started",
@@ -154,12 +201,22 @@ wss.on("connection", (ws) => {
               break;
 
             case "input_audio_buffer.speech_stopped":
+              console.log("Speech ended - processing translation");
               ws.send(
                 JSON.stringify({
                   type: "speech_stopped",
                   message: "Processing...",
                 })
               );
+              // Let server VAD handle the commit and response automatically
+              break;
+
+            case "input_audio_buffer.committed":
+              console.log("Audio buffer committed by OpenAI VAD");
+              break;
+
+            case "conversation.item.created":
+              console.log("Conversation item created");
               break;
 
             case "error":
@@ -171,6 +228,10 @@ wss.on("connection", (ws) => {
                   message: "Translation error: " + message.error.message,
                 })
               );
+              break;
+
+            default:
+              console.log(`Unhandled OpenAI message type: ${message.type}`);
               break;
           }
         } catch (error) {
@@ -206,95 +267,32 @@ wss.on("connection", (ws) => {
   }
 
   async function streamAudioToOpenAI(ws, audioData) {
-    if (!openaiWs || !isSessionActive) return;
+    if (!openaiWs || !isSessionActive) {
+      console.log(`Cannot stream audio - openaiWs: ${!!openaiWs}, isSessionActive: ${isSessionActive}`);
+      return;
+    }
+
+    if (!audioData) {
+      console.log("No audio data received");
+      return;
+    }
 
     try {
-      // Convert Uint8Array to Buffer and append to audio buffer
+      // Convert Uint8Array to Buffer
       const newData = Buffer.from(audioData);
-      audioBuffer = Buffer.concat([audioBuffer, newData]);
+      console.log(`Received audio chunk: ${newData.length} bytes`);
 
-      console.log(
-        `Received audio chunk: ${newData.length} bytes, total buffer: ${audioBuffer.length} bytes`
+      // With server VAD, just send audio directly - let OpenAI handle buffering and commits
+      const base64Audio = newData.toString("base64");
+      openaiWs.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: base64Audio,
+        })
       );
-
-      // Send chunks when we have enough data (500ms worth = 24,000 bytes)
-      while (audioBuffer.length >= CHUNK_BYTES) {
-        const chunk = audioBuffer.slice(0, CHUNK_BYTES);
-        audioBuffer = audioBuffer.slice(CHUNK_BYTES);
-
-        const base64Audio = chunk.toString("base64");
-        openaiWs.send(
-          JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: base64Audio,
-          })
-        );
-        totalAudioSent += CHUNK_BYTES;
-        console.log(
-          `Sent audio chunk: ${CHUNK_BYTES} bytes (${CHUNK_MS}ms), total sent: ${totalAudioSent} bytes`
-        );
-      }
-
-      // Auto-commit every 2 seconds ONLY if we have enough data (200ms minimum)
-      const now = Date.now();
-      if (
-        audioBuffer.length >= MIN_BUFFER_SIZE &&
-        now - lastCommitTime > 2000
-      ) {
-        // Send any remaining data
-        if (audioBuffer.length > 0) {
-          const base64Audio = audioBuffer.toString("base64");
-          openaiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: base64Audio,
-            })
-          );
-          console.log(`Sent remaining audio: ${audioBuffer.length} bytes`);
-          totalAudioSent += audioBuffer.length;
-          audioBuffer = Buffer.alloc(0);
-        }
-
-        // VALIDATE: Only commit if we actually sent enough audio data
-        const minRequiredBytes = Math.floor(BYTES_PER_SECOND * 0.1); // 100ms = 12,000 bytes
-
-        console.log("minRequiredBytes", minRequiredBytes);
-        console.log("totalAudioSent", totalAudioSent);
-        if (totalAudioSent >= minRequiredBytes) {
-          // We have enough audio data, safe to commit
-          openaiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.commit",
-            })
-          );
-          console.log(
-            `✅ Committed audio buffer (sent ${totalAudioSent} bytes, required ${minRequiredBytes} bytes)`
-          );
-          totalAudioSent = 0; // Reset counter
-        } else {
-          console.log(
-            `❌ Skipping commit - not enough audio (sent ${totalAudioSent} bytes, required ${minRequiredBytes} bytes)`
-          );
-        }
-
-        lastCommitTime = now;
-
-        // Create response if not already in progress
-        if (!responseInProgress) {
-          openaiWs.send(
-            JSON.stringify({
-              type: "response.create",
-              response: {
-                modalities: ["audio", "text"],
-                instructions:
-                  "Translate the user audio into fluent Hindi and speak it back, preserving meaning and tone. Do not include English.",
-              },
-            })
-          );
-          responseInProgress = true;
-          console.log("Created response for translation");
-        }
-      }
+      
+      console.log(`Sent ${newData.length} bytes to OpenAI`);
+      
     } catch (error) {
       console.error("Error streaming audio:", error);
     }
@@ -303,38 +301,8 @@ wss.on("connection", (ws) => {
   async function stopSession(ws) {
     if (openaiWs && isSessionActive) {
       try {
-        // Send any remaining audio data
-        if (audioBuffer.length > 0) {
-          const base64Audio = audioBuffer.toString("base64");
-          openaiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: base64Audio,
-            })
-          );
-          totalAudioSent += audioBuffer.length;
-          console.log(
-            `Sent final audio: ${audioBuffer.length} bytes, total: ${totalAudioSent} bytes`
-          );
-        }
-
-        // VALIDATE: Only commit if we have enough audio data
-        const minRequiredBytes = Math.floor(BYTES_PER_SECOND * 0.1); // 100ms
-
-        if (totalAudioSent >= minRequiredBytes) {
-          // Commit the final buffer
-          openaiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.commit",
-            })
-          );
-          console.log(`✅ Final commit (sent ${totalAudioSent} bytes)`);
-        } else {
-          console.log(
-            `❌ Skipping final commit - not enough audio (${totalAudioSent} bytes)`
-          );
-        }
-
+        console.log("Stopping translation session");
+        
         setTimeout(() => {
           if (openaiWs) {
             openaiWs.close();
@@ -342,7 +310,7 @@ wss.on("connection", (ws) => {
             responseInProgress = false;
             openaiWs = null;
           }
-        }, 1000);
+        }, 500);
 
         ws.send(
           JSON.stringify({
